@@ -128,7 +128,7 @@ template<typename T> void doCompute(unsigned workSize)
 	T gpuResults;
 	for(int i = 0; i < iterations; i++){
 		 gpuResults += transformAndSumGPU(hostData, ReciprocalFunctor<T>());
-			gpuResults += transformAndSumGPUCustomTempAlloc(hostData, ReciprocalFunctor<T>());
+		
 
 	}
 
