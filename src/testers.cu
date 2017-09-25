@@ -132,7 +132,11 @@ template<typename T> void doCompute(unsigned workSize)
 	T gpuResults;
 	std::vector<std::thread> threads(iterations);
 	for(int i = 0; i < iterations; i++){
-	//	transformAndSumGPUCustomTempAlloc(hostData, ReciprocalFunctor<T>(),gpuResults,streams[0]);
+
+		 gpuResults += transformAndSumGPU(hostData, ReciprocalFunctor<T>());
+		
+
+
 	}
 
 
