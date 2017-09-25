@@ -15,8 +15,10 @@
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <cassert>
-
+#include <atomic>
+#include <ctime>
 
 // This example demonstrates how to intercept calls to get_temporary_buffer
 // and return_temporary_buffer to control how Thrust allocates temporary storage
@@ -29,7 +31,12 @@
 // (host) threads use the same cached_allocator then they should gain exclusive
 // access to the allocator before accessing its methods.
 
+struct BlazingCachedAllocation{
 
+	char * allocatedSpace;
+	std::ptrdiff_t numBytes;
+	std::clock_t lastAccessed;
+};
 // cached_allocator: a simple allocator for caching allocation requests
 class cached_allocator
 {
@@ -37,7 +44,10 @@ class cached_allocator
     // just allocate bytes
     typedef char value_type;
 
-    cached_allocator() {}
+    cached_allocator(size_t maxSize) {
+    	this->maxSize =  maxSize;
+    	this->curConsumption = 0;
+    }
 
     ~cached_allocator()
     {
@@ -47,66 +57,116 @@ class cached_allocator
 
     char *allocate(std::ptrdiff_t num_bytes)
     {
-      char *result = 0;
+    	bool allocated = false;
+    	BlazingCachedAllocation * allocation;
+    	// search the cache for a free block
+    	while ( ! allocated){
+    		allocMutex.lock();
+    		free_blocks_type::iterator free_block = free_blocks.lower_bound(num_bytes);
 
-      // search the cache for a free block
-      free_blocks_type::iterator free_block = free_blocks.lower_bound(num_bytes);
+    		if(free_block != free_blocks.end())
+    		{
+    			//std::cout << "cached_allocator::allocator(): found a hit" << std::endl;
 
-      if(free_block != free_blocks.end())
-      {
-        //std::cout << "cached_allocator::allocator(): found a hit" << std::endl;
+    			// get the pointer
 
-        // get the pointer
-        result = free_block->second;
+    			allocation = free_block->second;
 
-        // erase from the free_blocks map
-        free_blocks.erase(free_block);
-      }
-      else
-      {
-        // no allocation of the right size exists
-        // create a new one with cuda::malloc
-        // throw if cuda::malloc can't satisfy the request
-        try
-        {
-          //std::cout << "cached_allocator::allocator(): no free block found; calling cuda::malloc" << std::endl;
+    			// erase from the free_blocks map
+    			free_blocks.erase(free_block);
+    			allocMutex.unlock();
+    			allocated = true;
+    		}
+    		else
+    		{
+    			allocMutex.unlock();
+    			//before we allocate we need to make sure there is room  if there isn't we try this all over
+    			consumedAmountMutex.lock();
+    			//there should be some kind of compare swap operations that can allow this to be lock free
+    			if((curConsumption + num_bytes ) < this->maxSize){
+    				curConsumption += num_bytes;
+    				consumedAmountMutex.unlock();
+    				allocated = true;
 
-          // allocate memory and convert cuda::pointer to raw pointer
-        	cudaMalloc((void **) &result, num_bytes);
-          //result = thrust::cuda::malloc<char>(num_bytes).get();
-        }
-        catch(std::runtime_error &e)
-        {
-          throw;
-        }
-      }
+    				try
+    				{
+    					//this wont work here has to be lockekd as well
+    					//        	while((curConsumption + num_bytes) >  maxSize){
+    					//       	  collectGarbage();
+    					//        }
+
+    					allocation = new BlazingCachedAllocation();
+
+    					//std::cout << "cached_allocator::allocator(): no free block found; calling cuda::malloc" << std::endl;
+
+    					// allocate memory and convert cuda::pointer to raw pointer
+    					allocation->numBytes = num_bytes;
+    					cudaMalloc((void **) &allocation->allocatedSpace, num_bytes);
+
+    					allocated = true;
+    					//result = thrust::cuda::malloc<char>(num_bytes).get();
+    				}
+    				catch(std::runtime_error &e)
+    				{
+    					throw;
+    				}
+
+    			}else{
+    				consumedAmountMutex.unlock();
+    				std::cout<<"Going again!"<<std::endl;
+    			}
+
+
+    			// no allocation of the right size exists
+    			// create a new one with cuda::malloc
+    			// throw if cuda::malloc can't satisfy the request
+
+
+    		}
+
+    	}
+
 
       // insert the allocated pointer into the allocated_blocks map
-      allocated_blocks.insert(std::make_pair(result, num_bytes));
+      consumedMutex.lock();
+     // allocation->lastAccessed = std::clock();
+      allocated_blocks.insert(std::make_pair(allocation->allocatedSpace, allocation));
+      consumedMutex.unlock();
+      return allocation->allocatedSpace;
+    }
 
-      return result;
+    void collectGarbage(){
+    	//free blocks that have not been used for a while
     }
 
     void deallocate(char *ptr, size_t n)
     {
       // erase the allocated block from the allocated blocks map
+    	consumedMutex.lock();
       allocated_blocks_type::iterator iter = allocated_blocks.find(ptr);
-      std::ptrdiff_t num_bytes = iter->second;
+      BlazingCachedAllocation * allocation = iter->second;
       allocated_blocks.erase(iter);
-
+      consumedMutex.unlock();
       // insert the block into the free blocks map
-      free_blocks.insert(std::make_pair(num_bytes, ptr));
+      allocMutex.lock();
+      free_blocks.insert(std::make_pair(allocation->numBytes, allocation));
+      allocMutex.unlock();
     }
 
   private:
-    typedef std::multimap<std::ptrdiff_t, char*> free_blocks_type;
-    typedef std::map<char *, std::ptrdiff_t>     allocated_blocks_type;
+    typedef std::multimap<std::ptrdiff_t, BlazingCachedAllocation*> free_blocks_type;
+    typedef std::map<char *, BlazingCachedAllocation*>     allocated_blocks_type;
 
     free_blocks_type      free_blocks;
     allocated_blocks_type allocated_blocks;
-
+    std::mutex allocMutex;
+    std::mutex consumedMutex;
+    std::mutex consumedAmountMutex;
+    size_t maxSize;
+    std::atomic_size_t curConsumption;
     void free_all()
     {
+    	std::cout<<"Consumption size was "<<this->curConsumption/( 1024 * 1024)<<"MB"<<std::endl;
       //std::cout << "cached_allocator::free_all(): cleaning up after ourselves..." << std::endl;
 
       // deallocate all outstanding blocks in both lists
@@ -116,7 +176,8 @@ class cached_allocator
       {
         // transform the pointer to cuda::pointer before calling cuda::free
         //thrust::cuda::free(thrust::cuda::pointer<char>(i->second));
-        cudaFree(i->second);
+        cudaFree(i->second->allocatedSpace);
+        delete i->second;
       }
 
       for(allocated_blocks_type::iterator i = allocated_blocks.begin();
@@ -125,13 +186,14 @@ class cached_allocator
       {
         // transform the pointer to cuda::pointer before calling cuda::free
         cudaFree(i->first);
+        delete i->second;
  //   	  thrust::cuda::free(thrust::cuda::pointer<char>(i->first));
       }
     }
 
 };
 
-cached_allocator cachedDeviceAllocator;
+cached_allocator cachedDeviceAllocator(4000000000);
 
 template<typename T>
   struct BlazingDeviceAllocator : thrust::device_malloc_allocator<T>
